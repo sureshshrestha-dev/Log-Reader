@@ -1,0 +1,4 @@
+hi,
+how are you?
+ERROR: Some error message
+ERROR2
