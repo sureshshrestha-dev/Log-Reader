@@ -1,5 +1,6 @@
 import time
 from functools import wraps
+import threading  # Add this import
 
 def time_execution(func):
     @wraps(func)
@@ -55,17 +56,13 @@ class LogProcessor:
     def __enter__(self):
         self.file = open(self.file_path, 'r')
         self.line_count = sum(1 for _ in self.file)
-
-        # file.seek(0) Reset file pointer to beginning
-        # logic perfectly—that is a classic move when you need to consume a file stream twice (once to count, once to process).
-        #  Many developers forget to reset the pointer and end up with an empty file on the second read!
         self.file.seek(0)
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.file:
             self.file.close()
-        return False  # Re-raise any exceptions
+        return False
 
     def __len__(self):
         return self.line_count
@@ -87,39 +84,101 @@ class LogProcessor:
             else:
                 yield stripped_line
 
-# NEW CLASS: Inherits from LogProcessor
+
 class ErrorLogProcessor(LogProcessor):
     def __init__(self, file_path):
-        # Force the filter_type to 'error' by calling parent's __init__
         super().__init__(file_path, filter_type='error')
         
     def process_logs(self):
-        # Add [CRITICAL] prefix to every log
-        # Call parent's process_logs() first, then add extra logic
         for log in super().process_logs():
             yield f"[CRITICAL] {log}"
 
+
+def process_single_file(file_path):
+    """Process a single log file and print status"""
+    print(f"Starting to process: {file_path}")
+    try:
+        with LogProcessor(file_path) as processor:
+            # Count and process logs
+            error_count = 0
+            for log_entry in processor.process_logs():
+                # Just iterate to 'consume' the generator
+                error_count += 1
+            print(f"Finished {file_path} - Found {error_count} error logs")
+    except FileNotFoundError:
+        print(f"❌ File not found: {file_path}")
+    except Exception as e:
+        print(f"❌ Error processing {file_path}: {e}")
+
+
 @time_execution
 def main():
-    # Using the inherited ErrorLogProcessor class instead of the factory method
-    with ErrorLogProcessor('text.txt') as processor:
-        for log_entry in processor.process_logs():
-            print(log_entry)
-        print(f"Total log entries: {len(processor)}")
-        print(str(processor))
-        print(repr(processor))
-
-  # This will fail validation (for demonstration)
-    print("\n--- Testing validation ---")
-    try:
-        invalid_processor = LogProcessor('text.log')
-    except ValueError as e:
-        print(f"❌ Validation caught: {e}")
+    print("=" * 50)
+    print("SINGLE THREADED PROCESSING (for comparison)")
+    print("=" * 50)
     
-    try:
-        invalid_processor2 = LogProcessor(123)
-    except ValueError as e:
-        print(f"❌ Validation caught: {e}")
+    # Single-threaded processing (baseline)
+    process_single_file('text.txt')
+    process_single_file('large.txt')
+    
+    print("\n" + "=" * 50)
+    print("MULTI-THREADED PROCESSING")
+    print("=" * 50)
+    
+    # Create threads for both files
+    thread1 = threading.Thread(target=process_single_file, args=('text.txt',))
+    thread2 = threading.Thread(target=process_single_file, args=('large.txt',))
+    
+    # Start both threads (they run concurrently!)
+    thread1.start()
+    thread2.start()
+    
+    # Wait for both threads to complete
+    thread1.join()
+    thread2.join()
+    
+    print("\n✅ Both files processed concurrently!")
+    
+    # Optional: Demonstrate with ErrorLogProcessor
+    print("\n" + "=" * 50)
+    print("PROCESSING WITH ERRORLogProcessor (Threaded)")
+    print("=" * 50)
+    
+    def process_with_error_processor(file_path):
+        with ErrorLogProcessor(file_path) as processor:
+            print(f"Processing {file_path} with ErrorLogProcessor")
+            for log_entry in processor.process_logs():
+                print(f"  {log_entry[:50]}...")  # Print first 50 chars
+            print(f"Finished {file_path} - Total lines: {len(processor)}")
+    
+    thread3 = threading.Thread(target=process_with_error_processor, args=('text.txt',))
+    thread4 = threading.Thread(target=process_with_error_processor, args=('large.txt',))
+    
+    thread3.start()
+    thread4.start()
+    
+    thread3.join()
+    thread4.join()
 
 if __name__ == "__main__":
+    # Create a sample large.txt file if it doesn't exist
+    try:
+        with open('large.txt', 'r') as f:
+            pass
+    except FileNotFoundError:
+        print("Creating sample large.txt file...")
+        with open('large.txt', 'w') as f:
+            for i in range(100):
+                if i % 10 == 0:
+                    f.write(f"ERROR: Sample error log {i}\n")
+                else:
+                    f.write(f"INFO: Sample info log {i}\n")
+        print("Created large.txt with sample data\n")
+    
     main()
+
+
+# By running two threads, you made your program I/O concurrent.
+#  Even though the GIL prevents two Python threads from running Python calculations at the exact same microsecond,
+#  while thread1 is waiting for the disk to give it a line of text, the GIL is released, 
+# and thread2 can start reading its file. You effectively overlapped the "waiting" time!
