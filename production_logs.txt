@@ -1,0 +1,10 @@
+2026-06-05 12:00:00 [INFO] Application started successfully
+2026-06-05 12:01:00 [ERROR] Database connection failed: timeout after 30s
+2026-06-05 12:02:00 [WARNING] Memory usage at 80%
+2026-06-05 12:03:00 [INFO] Processing user request #12345
+2026-06-05 12:04:00 [ERROR] API call failed: 500 Internal Server Error
+2026-06-05 12:05:00 [DEBUG] Cache hit for key: user:123
+2026-06-05 12:06:00 [ERROR] Segmentation fault in module X
+2026-06-05 12:07:00 [INFO] Request completed in 234ms
+2026-06-05 12:08:00 [WARNING] Deprecated API endpoint used
+2026-06-05 12:09:00 [ERROR] Disk space low: only 5GB remaining

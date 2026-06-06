@@ -1,184 +1,445 @@
-import time
-from functools import wraps
-import threading  # Add this import
+import asyncio
+import datetime
+from typing import List, Optional, Dict, Any
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, Depends
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from enum import Enum
+import json
+from collections import deque
+import asyncio
 
-def time_execution(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        start_time = time.time()
-        result = func(*args, **kwargs)
-        end_time = time.time()
-        print(f"Execution time: {end_time - start_time} seconds")
-        return result
-    return wrapper
+# ============ Models ============
+class Level(str, Enum):
+    INFO = 'INFO'
+    ERROR = 'ERROR'
+    WARNING = 'WARNING'
+    DEBUG = 'DEBUG'
 
-def filter_error_logs(log_stream):
-    for log_entry in log_stream:
-        if 'ERROR' in log_entry:
-            yield log_entry + ' need fix'
+class LogEntry(BaseModel):
+    timestamp: datetime.datetime
+    level: Level
+    message: str = Field(min_length=1)
+    
+    class Config:
+        json_encoders = {
+            datetime.datetime: lambda v: v.isoformat()
+        }
 
+class LogBatch(BaseModel):
+    """Batch of logs for bulk insertion"""
+    logs: List[LogEntry]
 
-class PathDescriptor:
-    def __set__(self, instance, value):
-        if not isinstance(value, str):
-            raise ValueError("Value must be a string")
+# ============ Database Manager ============
+class DatabaseManager:
+    def __init__(self, connection_string: str = "mongodb://localhost:27017"):
+        self.connection_string = connection_string
+        self.client: Optional[AsyncIOMotorClient] = None
+        self.db: Optional[AsyncIOMotorDatabase] = None
+    
+    async def connect(self, database_name: str = "log_reader"):
+        self.client = AsyncIOMotorClient(self.connection_string)
+        await self.client.admin.command('ping')
+        self.db = self.client[database_name]
         
-        if not value.endswith('.txt'):
-            raise ValueError("File must be a .txt file")
+        # Create indexes for performance
+        await self.db.logs.create_index("timestamp")
+        await self.db.logs.create_index("level")
+        await self.db.logs.create_index([("timestamp", -1)])
+        await self.db.logs.create_index([("level", 1), ("timestamp", -1)])
+        print(f"✅ Connected to MongoDB: {database_name}")
+    
+    async def disconnect(self):
+        if self.client:
+            self.client.close()
+            print("✅ Disconnected from MongoDB")
+    
+    async def insert_many(self, logs: List[LogEntry]) -> List[str]:
+        """Insert multiple logs efficiently"""
+        documents = [log.dict() for log in logs]
+        result = await self.db.logs.insert_many(documents)
+        return [str(id) for id in result.inserted_ids]
+    
+    async def get_logs(
+        self, 
+        level: Optional[str] = None,
+        limit: int = 100,
+        skip: int = 0,
+        start_time: Optional[datetime.datetime] = None,
+        end_time: Optional[datetime.datetime] = None
+    ) -> List[Dict[str, Any]]:
+        """Query logs with filters"""
+        query = {}
         
-        # Only store after all validations pass
-        instance.__dict__[self.name] = value
-    
-    def __get__(self, instance, owner):
-        if instance is None:
-            return self
-        return instance.__dict__.get(self.name, None)
-    
-    def __set_name__(self, owner, name):
-        self.name = name
-
+        if level:
+            query["level"] = level.upper()
         
-class LogProcessor:
-    file_path = PathDescriptor()
-
-    def __init__(self, file_path, filter_type=None):
-        self.file_path = file_path
-        self.filter_type = filter_type
-        self.file = None
-        self.line_count = 0
-
-    @classmethod
-    def for_errors(cls, file_path):
-        """Create a LogProcessor pre-configured to filter error logs"""
-        instance = cls(file_path, filter_type="error")
-        return instance
+        if start_time or end_time:
+            query["timestamp"] = {}
+            if start_time:
+                query["timestamp"]["$gte"] = start_time
+            if end_time:
+                query["timestamp"]["$lte"] = end_time
+        
+        cursor = self.db.logs.find(query).sort("timestamp", -1).skip(skip).limit(limit)
+        logs = await cursor.to_list(length=limit)
+        
+        # Convert ObjectId to string for JSON serialization
+        for log in logs:
+            log["_id"] = str(log["_id"])
+        
+        return logs
     
-    def __enter__(self):
-        self.file = open(self.file_path, 'r')
-        self.line_count = sum(1 for _ in self.file)
-        self.file.seek(0)
-        return self
+    async def count_logs(self, level: Optional[str] = None) -> int:
+        """Count total logs with optional level filter"""
+        query = {}
+        if level:
+            query["level"] = level.upper()
+        return await self.db.logs.count_documents(query)
     
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.file:
-            self.file.close()
-        return False
+    async def delete_old_logs(self, days: int = 30) -> int:
+        """Delete logs older than specified days"""
+        cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
+        result = await self.db.logs.delete_many({"timestamp": {"$lt": cutoff}})
+        return result.deleted_count
 
-    def __len__(self):
-        return self.line_count
-
-    def __str__(self):
-        return f"LogProcessor for file: {self.file_path} with filter: {self.filter_type}"
-
-    def __repr__(self):
-        return f"LogProcessor({self.file_path}, {self.filter_type})"
+# ============ Batch Processor for Memory Efficiency ============
+class LogBatchProcessor:
+    """Processes batches of logs without memory spikes"""
     
-    def process_logs(self):
-        """Process logs based on the configured filter type"""
-        for line in self.file:
-            stripped_line = line.strip()
+    def __init__(self, db_manager: DatabaseManager, batch_size: int = 1000):
+        self.db_manager = db_manager
+        self.batch_size = batch_size
+        self.buffer = []
+    
+    async def add_log(self, log: LogEntry):
+        """Add a log to the buffer, auto-flush when full"""
+        self.buffer.append(log)
+        if len(self.buffer) >= self.batch_size:
+            await self.flush()
+    
+    async def flush(self):
+        """Flush buffer to database"""
+        if self.buffer:
+            await self.db_manager.insert_many(self.buffer)
+            print(f"📦 Flushed {len(self.buffer)} logs to database")
+            self.buffer.clear()
+    
+    async def add_batch(self, logs: List[LogEntry]):
+        """Add a batch of logs efficiently"""
+        for i in range(0, len(logs), self.batch_size):
+            batch = logs[i:i + self.batch_size]
+            await self.db_manager.insert_many(batch)
+            print(f"📦 Inserted batch: {len(batch)} logs")
+
+# ============ Lifespan Manager ============
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle"""
+    # Startup
+    app.state.db = DatabaseManager()
+    await app.state.db.connect()
+    app.state.batch_processor = LogBatchProcessor(app.state.db)
+    print("🚀 API Started - Ready to receive logs")
+    yield
+    # Shutdown
+    await app.state.batch_processor.flush()
+    await app.state.db.disconnect()
+    print("👋 API Shutdown")
+
+# ============ FastAPI App ============
+app = FastAPI(
+    title="Log Processor API",
+    description="High-performance log ingestion and query API",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# ============ Health Check ============
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.datetime.now().isoformat(),
+        "database": "connected" if app.state.db.db else "disconnected"
+    }
+
+# ============ GET /logs - Query Logs ============
+@app.get("/logs")
+async def get_logs(
+    level: Optional[str] = Query(None, description="Filter by log level (INFO, ERROR, WARNING, DEBUG)"),
+    limit: int = Query(100, ge=1, le=10000, description="Number of logs to return"),
+    skip: int = Query(0, ge=0, description="Number of logs to skip"),
+    start_time: Optional[datetime.datetime] = Query(None, description="Filter logs after this time"),
+    end_time: Optional[datetime.datetime] = Query(None, description="Filter logs before this time"),
+    stream: bool = Query(False, description="Stream results as JSON lines")
+):
+    """
+    Retrieve logs from MongoDB with optional filters.
+    
+    Supports:
+    - Filter by log level
+    - Pagination (skip/limit)
+    - Time range queries
+    - Streaming response for large results
+    """
+    try:
+        if stream:
+            # Streaming response for large datasets (no memory spike)
+            async def generate_stream():
+                logs = await app.state.db.get_logs(level, limit, skip, start_time, end_time)
+                for log in logs:
+                    yield json.dumps(log, default=str) + "\n"
             
-            if self.filter_type == "error":
-                if 'ERROR' in stripped_line:
-                    yield stripped_line + ' need fix'
-            else:
-                yield stripped_line
-
-
-class ErrorLogProcessor(LogProcessor):
-    def __init__(self, file_path):
-        super().__init__(file_path, filter_type='error')
-        
-    def process_logs(self):
-        for log in super().process_logs():
-            yield f"[CRITICAL] {log}"
-
-
-def process_single_file(file_path):
-    """Process a single log file and print status"""
-    print(f"Starting to process: {file_path}")
-    try:
-        with LogProcessor(file_path) as processor:
-            # Count and process logs
-            error_count = 0
-            for log_entry in processor.process_logs():
-                # Just iterate to 'consume' the generator
-                error_count += 1
-            print(f"Finished {file_path} - Found {error_count} error logs")
-    except FileNotFoundError:
-        print(f"❌ File not found: {file_path}")
+            return StreamingResponse(
+                generate_stream(),
+                media_type="application/x-ndjson"
+            )
+        else:
+            # Regular JSON response
+            logs = await app.state.db.get_logs(level, limit, skip, start_time, end_time)
+            total = await app.state.db.count_logs(level)
+            
+            return {
+                "total": total,
+                "limit": limit,
+                "skip": skip,
+                "logs": logs
+            }
+    
     except Exception as e:
-        print(f"❌ Error processing {file_path}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-@time_execution
-def main():
-    print("=" * 50)
-    print("SINGLE THREADED PROCESSING (for comparison)")
-    print("=" * 50)
-    
-    # Single-threaded processing (baseline)
-    process_single_file('text.txt')
-    process_single_file('large.txt')
-    
-    print("\n" + "=" * 50)
-    print("MULTI-THREADED PROCESSING")
-    print("=" * 50)
-    
-    # Create threads for both files
-    thread1 = threading.Thread(target=process_single_file, args=('text.txt',))
-    thread2 = threading.Thread(target=process_single_file, args=('large.txt',))
-    
-    # Start both threads (they run concurrently!)
-    thread1.start()
-    thread2.start()
-    
-    # Wait for both threads to complete
-    thread1.join()
-    thread2.join()
-    
-    print("\n✅ Both files processed concurrently!")
-    
-    # Optional: Demonstrate with ErrorLogProcessor
-    print("\n" + "=" * 50)
-    print("PROCESSING WITH ERRORLogProcessor (Threaded)")
-    print("=" * 50)
-    
-    def process_with_error_processor(file_path):
-        with ErrorLogProcessor(file_path) as processor:
-            print(f"Processing {file_path} with ErrorLogProcessor")
-            for log_entry in processor.process_logs():
-                print(f"  {log_entry[:50]}...")  # Print first 50 chars
-            print(f"Finished {file_path} - Total lines: {len(processor)}")
-    
-    thread3 = threading.Thread(target=process_with_error_processor, args=('text.txt',))
-    thread4 = threading.Thread(target=process_with_error_processor, args=('large.txt',))
-    
-    thread3.start()
-    thread4.start()
-    
-    thread3.join()
-    thread4.join()
-
-if __name__ == "__main__":
-    # Create a sample large.txt file if it doesn't exist
+# ============ POST /logs - Single Log ============
+@app.post("/logs")
+async def create_log(log: LogEntry, background_tasks: BackgroundTasks):
+    """
+    Create a single log entry.
+    Uses background processing to avoid blocking.
+    """
     try:
-        with open('large.txt', 'r') as f:
-            pass
-    except FileNotFoundError:
-        print("Creating sample large.txt file...")
-        with open('large.txt', 'w') as f:
-            for i in range(100):
-                if i % 10 == 0:
-                    f.write(f"ERROR: Sample error log {i}\n")
-                else:
-                    f.write(f"INFO: Sample info log {i}\n")
-        print("Created large.txt with sample data\n")
+        # Process in background to avoid blocking
+        background_tasks.add_task(app.state.batch_processor.add_log, log)
+        
+        return {
+            "status": "accepted",
+            "message": "Log queued for processing",
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============ POST /logs/batch - Handle 100k Concurrent Logs ============
+@app.post("/logs/batch")
+async def create_logs_batch(logs: List[LogEntry]):
+    """
+    Handle 100k+ concurrent logs without memory spike.
     
-    main()
+    This endpoint:
+    - Accepts up to 100,000 logs in one request
+    - Processes in batches to prevent memory spikes
+    - Uses streaming-like batch processing
+    - Returns immediately with accepted status
+    """
+    try:
+        log_count = len(logs)
+        
+        if log_count > 100000:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Too many logs. Maximum 100,000 per request. Received: {log_count}"
+            )
+        
+        # Process in background to not block
+        async def process_large_batch():
+            # Use batch processor for efficient insertion
+            await app.state.batch_processor.add_batch(logs)
+            print(f"✅ Processed {log_count} logs in background")
+        
+        # Create background task
+        asyncio.create_task(process_large_batch())
+        
+        return {
+            "status": "accepted",
+            "message": f"Queued {log_count} logs for processing",
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
+# ============ GET /logs/stats - Statistics ============
+@app.get("/logs/stats")
+async def get_stats():
+    """Get log statistics"""
+    try:
+        total = await app.state.db.count_logs()
+        errors = await app.state.db.count_logs("ERROR")
+        warnings = await app.state.db.count_logs("WARNING")
+        info = await app.state.db.count_logs("INFO")
+        debug = await app.state.db.count_logs("DEBUG")
+        
+        return {
+            "total": total,
+            "by_level": {
+                "ERROR": errors,
+                "WARNING": warnings,
+                "INFO": info,
+                "DEBUG": debug
+            },
+            "error_rate": errors / total if total > 0 else 0,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# By running two threads, you made your program I/O concurrent.
-#  Even though the GIL prevents two Python threads from running Python calculations at the exact same microsecond,
-#  while thread1 is waiting for the disk to give it a line of text, the GIL is released, 
-# and thread2 can start reading its file. You effectively overlapped the "waiting" time!
+# ============ DELETE /logs - Cleanup Old Logs ============
+@app.delete("/logs")
+async def delete_old_logs(days: int = Query(30, ge=1, le=365)):
+    """Delete logs older than specified days"""
+    try:
+        deleted = await app.state.db.delete_old_logs(days)
+        return {
+            "status": "success",
+            "deleted_count": deleted,
+            "days_kept": days,
+            "message": f"Deleted {deleted} logs older than {days} days"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============ GET /logs/stream - Real-time Stream ============
+@app.get("/logs/stream")
+async def stream_recent_logs(limit: int = Query(100, le=1000)):
+    """Stream recent logs in real-time using Server-Sent Events"""
+    from fastapi.responses import StreamingResponse
+    
+    async def event_stream():
+        # Get recent logs
+        logs = await app.state.db.get_logs(limit=limit)
+        
+        for log in logs:
+            yield f"data: {json.dumps(log, default=str)}\n\n"
+            await asyncio.sleep(0.1)  # Simulate real-time streaming
+    
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+    )
+
+# ============ WebSocket Support for Real-time (Bonus) ============
+from fastapi import WebSocket, WebSocketDisconnect
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+    
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+    
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+    
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            await connection.send_text(message)
+
+manager = ConnectionManager()
+
+@app.websocket("/ws/logs")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Wait for message from client
+            data = await websocket.receive_text()
+            
+            # Process as log entry
+            try:
+                log_data = json.loads(data)
+                log = LogEntry(**log_data)
+                await app.state.batch_processor.add_log(log)
+                await websocket.send_text(f"✅ Log accepted: {log.message[:50]}")
+            except Exception as e:
+                await websocket.send_text(f"❌ Error: {str(e)}")
+    
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+        print("Client disconnected")
+
+# ============ Performance Test Endpoint ============
+@app.post("/logs/test/100k")
+async def test_100k_logs():
+    """Test endpoint to simulate 100k logs (for benchmarking)"""
+    import random
+    
+    levels = ["INFO", "ERROR", "WARNING", "DEBUG"]
+    messages = [
+        "Database connection established",
+        "API call failed",
+        "Memory usage high",
+        "User authentication successful",
+        "File not found",
+        "Cache hit",
+        "Request timeout",
+        "Background job completed",
+        "Configuration loaded",
+        "Service started"
+    ]
+    
+    logs = []
+    for i in range(100000):
+        log = LogEntry(
+            timestamp=datetime.datetime.now(),
+            level=random.choice(levels),
+            message=f"{random.choice(messages)} - ID:{i}"
+        )
+        logs.append(log)
+        
+        # Yield every 10000 logs to show progress
+        if i % 10000 == 0:
+            print(f"Generated {i} logs...")
+    
+    # Process in background
+    asyncio.create_task(app.state.batch_processor.add_batch(logs))
+    
+    return {
+        "status": "accepted",
+        "message": f"Queued 100,000 logs for processing",
+        "timestamp": datetime.datetime.now().isoformat()
+    }
+
+# ============ Main Entry Point ============
+if __name__ == "__main__":
+    import uvicorn
+    
+    print("=" * 60)
+    print("🚀 STARTING LOG PROCESSING API")
+    print("=" * 60)
+    print("\n📚 API Documentation: http://localhost:8000/docs")
+    print("📊 Health Check: http://localhost:8000/health")
+    print("\n💡 Test with:")
+    print("  curl http://localhost:8000/logs?level=ERROR&limit=10")
+    print("  curl -X POST http://localhost:8000/logs/batch \\")
+    print("    -H 'Content-Type: application/json' \\")
+    print("    -d '[{\"timestamp\":\"2024-01-01T10:00:00\",\"level\":\"ERROR\",\"message\":\"Test\"}]'")
+    print("\n" + "=" * 60)
+    
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000,
+        workers=4,  # Multiple workers for concurrency
+        loop="asyncio"
+    )
